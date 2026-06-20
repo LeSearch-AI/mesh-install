@@ -39,6 +39,9 @@ Usage:
 
 Options:
   --token VALUE    Auth token for meshd (default: \$MESHD_TOKEN or generated).
+  --user NAME      (Linux) Provision an isolated agent: create Unix user NAME and
+                   run its own meshd on a free port (8901+). Add --uninstall to tear
+                   it down (--purge also deletes the user). Sandboxes risky work.
   --src SRC        Payload source: a base URL (fetches SRC/mesh-install.tgz),
                    a direct .tgz/.tar.gz URL, or a local tarball path.
                    Default: baked-in source, else a local ./payload checkout.
@@ -279,6 +282,82 @@ service_stop() {
   return $st_removed
 }
 
+# ---------- isolated agent users (--user) ----------
+#
+# Sandbox an agent on a Linux box: create a separate Unix user that runs its OWN
+# meshd on its own port. Standard Unix permissions then keep that agent out of
+# your real user's files. Linux-only (the sandbox target is a server/VPS).
+
+port_in_use() {
+  if command -v ss >/dev/null 2>&1; then ss -ltn 2>/dev/null | grep -q "[:.]$1 " && return 0; fi
+  if command -v lsof >/dev/null 2>&1; then lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1 && return 0; fi
+  return 1
+}
+
+find_free_port() {  # first free port in [$1,$2]
+  ffp=$1
+  while [ "$ffp" -le "$2" ]; do port_in_use "$ffp" || { printf '%s' "$ffp"; return 0; }; ffp=$((ffp + 1)); done
+  return 1
+}
+
+# Resolve the installer source the per-user install should re-fetch from.
+provision_source() {
+  ps_src="${SRC_FLAG:-${MESH_SRC:-}}"
+  { [ -z "$ps_src" ] && [ "$MESH_SRC_DEFAULT" != "__MESH_SRC__" ]; } && ps_src="$MESH_SRC_DEFAULT"
+  [ -n "$ps_src" ] || die "--user needs a release installer (baked source) or --src URL"
+  case "$ps_src" in *install.sh) printf '%s' "$ps_src";; *) printf '%s/install.sh' "${ps_src%/}";; esac
+}
+
+provision_privilege() {  # echoes "" if root, "sudo" if usable, else dies
+  if [ "$(id -u)" = 0 ]; then return 0; fi
+  command -v sudo >/dev/null 2>&1 || die "--user needs root or sudo"
+  printf 'sudo'
+}
+
+provision_user() {
+  pu_name="$1"
+  [ "$OS_NAME" = "Linux" ] || die "--user is Linux-only (sandbox an agent on a Linux/WSL box); create the user manually on macOS"
+  case "$pu_name" in ''|*[!a-z0-9_-]*) die "--user name must be lowercase letters, digits, '_' or '-'";; esac
+  SUDO=$(provision_privilege)
+  pu_url=$(provision_source)
+  if ! id "$pu_name" >/dev/null 2>&1; then
+    log "Creating isolated user '$pu_name'"
+    $SUDO useradd -m -s /bin/bash "$pu_name" || die "useradd failed for $pu_name"
+  fi
+  $SUDO loginctl enable-linger "$pu_name" 2>/dev/null || warn "could not enable linger for $pu_name (services may stop on logout)"
+  pu_port="${MESHD_PORT:-$(find_free_port 8901 8999)}"
+  [ -n "$pu_port" ] || die "no free port in 8901-8999 for the sandbox"
+  pu_token="${TOKEN_FLAG:-${MESHD_TOKEN:-}}"; [ -n "$pu_token" ] || pu_token=$(gen_token)
+  log "Installing isolated meshd as '$pu_name' on port $pu_port"
+  $SUDO -u "$pu_name" --login env MESHD_PORT="$pu_port" MESH_SRC="${SRC_FLAG:-${MESH_SRC:-$MESH_SRC_DEFAULT}}" \
+    sh -c "curl -fsSL '$pu_url' | MESHD_PORT='$pu_port' sh -s -- --only meshd --token '$pu_token'" \
+    || die "per-user install failed for $pu_name"
+  pu_ip=""; command -v tailscale >/dev/null 2>&1 && pu_ip=$(tailscale ip -4 2>/dev/null | head -1)
+  printf '\nIsolated agent box ready:\n'
+  printf '  user:  %s\n  port:  %s\n  token: %s\n' "$pu_name" "$pu_port" "$pu_token"
+  [ -n "$pu_ip" ] && printf '  add in app: host=<name> ip=%s port=%s token=<above>\n' "$pu_ip" "$pu_port"
+  printf '  remove: sh install.sh --user %s --uninstall --purge\n' "$pu_name"
+}
+
+deprovision_user() {
+  du_name="$1"
+  [ "$OS_NAME" = "Linux" ] || die "--user is Linux-only"
+  case "$du_name" in ''|*[!a-z0-9_-]*) die "invalid --user name";; esac
+  SUDO=$(provision_privilege)
+  if id "$du_name" >/dev/null 2>&1; then
+    du_url=$(provision_source)
+    $SUDO -u "$du_name" --login sh -c "curl -fsSL '$du_url' | sh -s -- --only meshd --uninstall --purge" 2>/dev/null || true
+    if [ "$DO_PURGE" = "1" ]; then
+      $SUDO loginctl disable-linger "$du_name" 2>/dev/null || true
+      $SUDO userdel -r "$du_name" 2>/dev/null && log "Removed user $du_name" || warn "userdel failed for $du_name"
+    else
+      log "Stopped $du_name's mesh (user kept; add --purge to delete the user)"
+    fi
+  else
+    log "No such user: $du_name"
+  fi
+}
+
 resolve_script_dir() {
   case "$0" in
     */*) script_path="$0";;
@@ -434,12 +513,13 @@ do_uninstall() {
 
 # ---------- arg parsing ----------
 
-TOKEN_FLAG=""; SRC_FLAG=""; ONLY_LIST=""; WITHOUT_LIST=""
+TOKEN_FLAG=""; SRC_FLAG=""; ONLY_LIST=""; WITHOUT_LIST=""; USER_FLAG=""
 DO_UNINSTALL="0"; DO_PURGE="0"; DO_LIST="0"; NO_START="0"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --token) shift; [ "$#" -gt 0 ] || die "--token requires a value"; TOKEN_FLAG="$1";;
+    --user) shift; [ "$#" -gt 0 ] || die "--user requires a name"; USER_FLAG="$1";;
     --src) shift; [ "$#" -gt 0 ] || die "--src requires a value"; SRC_FLAG="$1";;
     --only) shift; [ "$#" -gt 0 ] || die "--only requires a value"; ONLY_LIST="$1";;
     --without) shift; [ "$#" -gt 0 ] || die "--without requires a value"; WITHOUT_LIST="$1";;
@@ -464,6 +544,13 @@ case "$OS_NAME" in Darwin|Linux) ;; *) die "unsupported OS: ${OS_NAME:-unknown} 
 case "$ARCH_NAME" in arm64|aarch64|x86_64) ;; *) die "unsupported arch: ${ARCH_NAME:-unknown}";; esac
 
 SERVICE_MGR=$(detect_service_mgr)
+
+# --user: provision (or with --uninstall, tear down) an isolated agent user that
+# runs its own meshd on its own port. Meta-operation — handle before anything else.
+if [ -n "$USER_FLAG" ]; then
+  if [ "$DO_UNINSTALL" = "1" ]; then deprovision_user "$USER_FLAG"; else provision_user "$USER_FLAG"; fi
+  exit $?
+fi
 
 # list / uninstall are pure local operations — handle before any fetch
 if [ "$DO_LIST" = "1" ]; then do_list; exit 0; fi
