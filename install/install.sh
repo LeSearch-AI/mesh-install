@@ -149,6 +149,7 @@ detect_service_mgr() {
   printf 'tmux'
 }
 
+mux_session()   { printf '%s-%s' "$LABEL_PREFIX" "$1"; }   # tmux session name, label-isolated
 launchd_label() { printf '%s.%s' "$LABEL_PREFIX" "$1"; }
 launchd_plist() { printf '%s/Library/LaunchAgents/%s.%s.plist' "$HOME" "$LABEL_PREFIX" "$1"; }
 systemd_unit()  { printf '%s/.config/systemd/user/%s-%s.service' "$HOME" "$LABEL_PREFIX" "$1"; }
@@ -222,7 +223,11 @@ systemd_user_env() { [ -n "${XDG_RUNTIME_DIR:-}" ] || { XDG_RUNTIME_DIR="/run/us
 # Installs + (re)starts under the detected supervisor. Echoes nothing; sets no globals.
 service_start() {
   ss_name="$1"; ss_workdir="$2"; ss_entry="$3"; ss_env=$(cat)
-  kill_session "$ss_name" >/dev/null 2>&1 || true   # drop any legacy tmux session
+  # Drop our own prior (prefixed) tmux session so test installs never touch prod.
+  kill_session "$(mux_session "$ss_name")" >/dev/null 2>&1 || true
+  # ponytail: only a real default-prefix install migrates a legacy deploy.sh "meshd"
+  # tmux session (plain name). A custom MESH_LABEL_PREFIX stays fully isolated.
+  [ "$LABEL_PREFIX" = "ai.lesearch" ] && kill_session "$ss_name" >/dev/null 2>&1 || true
   case "$SERVICE_MGR" in
     launchd)
       ss_plist=$(launchd_plist "$ss_name"); ss_label=$(launchd_label "$ss_name")
@@ -245,7 +250,7 @@ service_start() {
       ;;
     *)  # tmux fallback (does NOT survive reboot)
       ss_flat=$(printf '%s' "$ss_env" | tr '\n' ' ')   # env values are space-free
-      start_session "$ss_name" "$ss_workdir" "env $ss_flat $BUN_BIN run $ss_entry"
+      start_session "$(mux_session "$ss_name")" "$ss_workdir" "env $ss_flat $BUN_BIN run $ss_entry"
       ;;
   esac
 }
@@ -268,7 +273,7 @@ service_stop() {
       rm -f "$st_unit"; systemctl --user daemon-reload 2>/dev/null || true; st_removed=0
     fi
   fi
-  kill_session "$st_name" >/dev/null 2>&1 && st_removed=0 || true
+  kill_session "$(mux_session "$st_name")" >/dev/null 2>&1 && st_removed=0 || true
   return $st_removed
 }
 
@@ -389,7 +394,7 @@ install_deps() { ( cd "$1" && bun install ); }
 service_state() {  # prints launchd|systemd|tmux supervisor state for a service name
   if [ "$OS_NAME" = "Darwin" ] && [ -f "$(launchd_plist "$1")" ]; then printf 'launchd'; return; fi
   [ -f "$(systemd_unit "$1")" ] && { printf 'systemd'; return; }
-  command -v tmux >/dev/null 2>&1 && tmux has-session -t "$1" 2>/dev/null && { printf 'tmux'; return; }
+  command -v tmux >/dev/null 2>&1 && tmux has-session -t "$(mux_session "$1")" 2>/dev/null && { printf 'tmux'; return; }
   printf 'none'
 }
 
