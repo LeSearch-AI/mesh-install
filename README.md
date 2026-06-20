@@ -8,6 +8,13 @@ Services are registered with a real supervisor so they **survive reboot**:
 launchd on macOS, systemd `--user` (with linger) on Linux/WSL, tmux fallback
 otherwise. Built on Bun + TypeScript — no Node, no heavyweight runtime.
 
+**Reached only over your Tailscale tailnet** — never the public internet. Access is
+gated by your Tailscale ACL plus a bearer token. Nothing is port-forwarded or exposed.
+
+> **Setting this up with an AI agent?** Point it at **[AGENTS.md](AGENTS.md)** — it has
+> the secure, few-step playbook and the rules for never leaking IPs, hostnames, or
+> tokens.
+
 ## Install
 
 ```sh
