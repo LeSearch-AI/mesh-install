@@ -348,8 +348,12 @@ deprovision_user() {
     du_url=$(provision_source)
     $SUDO -u "$du_name" --login sh -c "curl -fsSL '$du_url' | sh -s -- --only meshd --uninstall --purge" 2>/dev/null || true
     if [ "$DO_PURGE" = "1" ]; then
+      # Stop the user's systemd manager + any stragglers, or userdel refuses.
       $SUDO loginctl disable-linger "$du_name" 2>/dev/null || true
-      $SUDO userdel -r "$du_name" 2>/dev/null && log "Removed user $du_name" || warn "userdel failed for $du_name"
+      $SUDO loginctl terminate-user "$du_name" 2>/dev/null || true
+      $SUDO pkill -KILL -u "$du_name" 2>/dev/null || true
+      sleep 1
+      $SUDO userdel -rf "$du_name" 2>/dev/null && log "Removed user $du_name" || warn "userdel failed for $du_name (try: sudo userdel -rf $du_name)"
     else
       log "Stopped $du_name's mesh (user kept; add --purge to delete the user)"
     fi
