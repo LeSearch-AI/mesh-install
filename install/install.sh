@@ -117,7 +117,9 @@ ensure_bun() {
   bun_installer=$(mktemp "${TMPDIR:-/tmp}/bun-install.XXXXXX")
   log "Installing bun into $HOME/.bun"
   curl -fsSL https://bun.sh/install -o "$bun_installer"
-  sh "$bun_installer"
+  # bun's installer is a bash script (uses pipefail/arrays) — sh/dash can't run it.
+  if command -v bash >/dev/null 2>&1; then bash "$bun_installer"
+  else die "installing bun requires bash; install bash or bun first"; fi
   rm -f "$bun_installer"
   PATH="$HOME/.bun/bin:$PATH"; export PATH
   command -v bun >/dev/null 2>&1 || die "bun install completed but bun is still unavailable"
